@@ -4,8 +4,9 @@ import shutil
 from pathlib import Path
 from dotenv import load_dotenv
 
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from app.parser    import extract_text_from_pdf, chunk_pages
@@ -28,15 +29,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    return JSONResponse(status_code=500, content={"detail": str(exc)})
+
 UPLOAD_DIR = Path("./uploads")
 VECTOR_DIR = "./vectorstore"
 UPLOAD_DIR.mkdir(exist_ok=True)
+Path(VECTOR_DIR).mkdir(exist_ok=True)
 
-# In-memory registry  { doc_id: { filename, pages, chunks } }
 documents: dict = {}
 
-
-# ── Models ───────────────────────────────────────────────────────────────────
 
 class AskRequest(BaseModel):
     doc_id: str
@@ -45,11 +48,10 @@ class AskRequest(BaseModel):
 class AskResponse(BaseModel):
     answer: str
     sources: list[str]
+    source_chunks: list[dict]
     model: str
     chunks_used: int
 
-
-# ── Routes ───────────────────────────────────────────────────────────────────
 
 @app.get("/")
 def root():
@@ -61,7 +63,6 @@ def root():
 
 @app.post("/upload")
 async def upload_document(file: UploadFile = File(...)):
-    """Upload a PDF. Returns doc_id to use in /ask."""
     if not file.filename.endswith(".pdf"):
         raise HTTPException(400, "Only PDF files are supported.")
 
@@ -81,22 +82,15 @@ async def upload_document(file: UploadFile = File(...)):
     documents[doc_id] = {
         "doc_id":   doc_id,
         "filename": file.filename,
-        "pages":    len(pages),
-        "chunks":   len(chunks)
+        "pages_extracted": len(pages),
+        "chunks_created":  len(chunks)
     }
 
-    return {
-        "doc_id":          doc_id,
-        "filename":        file.filename,
-        "pages_extracted": len(pages),
-        "chunks_created":  len(chunks),
-        "message":         "Ready. Use doc_id to ask questions."
-    }
+    return documents[doc_id] | {"message": "Ready. Use doc_id to ask questions."}
 
 
 @app.post("/ask", response_model=AskResponse)
 def ask_question(req: AskRequest):
-    """Ask a question about an uploaded document."""
     if req.doc_id not in documents:
         raise HTTPException(404, f"Document '{req.doc_id}' not found.")
     if not req.question.strip():
@@ -118,12 +112,9 @@ def list_documents():
 def delete_document(doc_id: str):
     if doc_id not in documents:
         raise HTTPException(404, "Document not found.")
-
     delete_collection(doc_id, persist_dir=VECTOR_DIR)
-
     pdf = UPLOAD_DIR / f"{doc_id}.pdf"
     if pdf.exists():
         pdf.unlink()
-
     del documents[doc_id]
     return {"message": f"Document '{doc_id}' deleted."}
